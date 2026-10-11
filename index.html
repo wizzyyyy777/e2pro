@@ -374,6 +374,12 @@ textarea.field:focus,input.field:focus{border-color:var(--cyan);box-shadow:0 0 0
 @keyframes toastIn{from{opacity:0;transform:translateY(-16px) scale(.96)}}
 @keyframes toastOut{to{opacity:0;transform:translateY(-12px) scale(.96)}}
 
+/* Pairing-Status-Abzeichen */
+.pair-badge{font-size:12px;font-weight:700;padding:5px 11px;border-radius:999px;border:1px solid var(--line2);color:var(--muted);white-space:nowrap}
+.pair-badge.ok{color:var(--green);border-color:rgba(52,255,176,.45);background:rgba(52,255,176,.08)}
+.pair-badge.warn{color:var(--amber);border-color:rgba(255,181,71,.45);background:rgba(255,181,71,.08)}
+.pair-badge.err{color:var(--red);border-color:rgba(255,77,109,.45);background:rgba(255,77,109,.08)}
+
 @media (prefers-reduced-motion: reduce){
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
 }
@@ -505,6 +511,22 @@ textarea.field:focus,input.field:focus{border-color:var(--cyan);box-shadow:0 0 0
     <!-- ===================== ENTDECKER ===================== -->
     <section class="view" data-view="explore">
       <div class="card glass">
+        <div class="row" style="margin-bottom:10px">
+          <h3 style="margin:0">Pairing &amp; Verschlüsselung</h3>
+          <span class="pair-badge" id="pairState">Nicht gekoppelt</span>
+        </div>
+        <p class="batt-meta" style="margin:0 0 12px;line-height:1.5">Der E2 Pro sendet Daten erst nach verschlüsseltem Pairing. Beim ersten Mal musst du am Scooter kurz die <b>Einschalttaste</b> drücken, um zu bestätigen. Danach läuft es automatisch.</p>
+        <label class="batt-meta" style="display:block;margin-bottom:6px">Seriennummer (14 Zeichen, optional – steht am Scooter)</label>
+        <input class="field" id="snInput" placeholder="z. B. N4GZ..." autocomplete="off" autocapitalize="characters" spellcheck="false" style="margin-bottom:10px">
+        <div class="btns">
+          <button class="btn primary" id="pairBtn">Pairing starten</button>
+          <button class="btn" id="pairChannelBtn">Kanal: UART</button>
+          <button class="btn" id="pairForgetBtn">Kopplung löschen</button>
+        </div>
+        <p class="batt-meta" id="pairHint" style="margin:10px 0 0;line-height:1.5;color:var(--amber)"></p>
+      </div>
+
+      <div class="card glass">
         <h3>Gerät</h3>
         <div class="btns">
           <button class="btn primary" id="scanBtn">Services scannen</button>
@@ -603,7 +625,8 @@ const CONFIG = {
   // Services, auf die die App zugreifen darf (Web-Bluetooth-Pflicht).
   // Weitere UUIDs kannst du auch direkt im Entdecker-Tab ergänzen.
   optionalServices: [
-    '6e400001-b5a3-f393-e0a9-e50e24dcca9e', // Nordic UART Service (bei vielen Ninebots, beim E2 Pro unbestätigt)
+    '6e400001-b5a3-f393-e0a9-e50e24dcca9e', // Nordic UART Service (beim E2 Pro vorhanden)
+    'a6ed0800-d344-460a-8075-b9e8ec90d71b', // Segway-Service deines E2 Pro (Chars A6ED0801/0802/0803)
     0x180f,                                 // Battery Service (offizieller BLE-Standard, falls vorhanden)
     0x180a,                                 // Device Information (offizieller BLE-Standard, falls vorhanden)
     0xfe95,                                 // Xiaomi-Service (bei manchen Xiaomi/Ninebot-Geräten)
@@ -652,22 +675,593 @@ const CONFIG = {
     lock:      { service: null, characteristic: null, on: null /* sperren */, off: null /* entsperren */, withoutResponse: false }, // PLATZHALTER
     horn:      { service: null, characteristic: null, press: null, release: null, withoutResponse: false }, // PLATZHALTER Hupe
   },
+
+  /* ------------------------------------------------------------------ *
+   *  SICHERHEIT / VERSCHLÜSSELUNG (Segway-Ninebot "Encryption2")
+   *  Nötig, weil der E2 Pro sonst weder Daten sendet noch Befehle annimmt.
+   *  Schema dokumentiert: nootnooot.codeberg.page/segway-ninebot-ble
+   * ------------------------------------------------------------------ */
+  security: {
+    enabled: true,
+    // Seriennummer (14 Zeichen) steht am Scooter unterm Trittbrett und in der App.
+    // Leer lassen geht auch: Die PRE_COMM-Antwort liefert sie mit, wir nehmen sie dann von dort.
+    serialNumber: '',
+    sync2:   0xA5,     // 0xA5 = Gen2, 0xB5 = Gen3. Bei "MAC-Fehler" im Log auf 0xB5 umstellen.
+    targetId: 0x04,    // BLE-Board (Ziel im Handshake)
+
+    // Kanal für die verschlüsselte Kommunikation.
+    // Standard: Nordic UART (beim E2 Pro vorhanden). Antwortet nichts, probiere den
+    // Segway-Kanal darunter (im Pairing-Tab umschaltbar).
+    channel: {
+      service: '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+      write:   '6e400002-b5a3-f393-e0a9-e50e24dcca9e',
+      notify:  '6e400003-b5a3-f393-e0a9-e50e24dcca9e',
+    },
+    // Alternativer Kanal (Segway-Service deines Scooters) – per Button im Pairing-Tab wählbar.
+    altChannel: {
+      service: 'a6ed0800-d344-460a-8075-b9e8ec90d71b',
+      write:   'a6ed0801-d344-460a-8075-b9e8ec90d71b',
+      notify:  'a6ed0802-d344-460a-8075-b9e8ec90d71b',
+    },
+
+    // DIS-Board-Register zum Auslesen (CMD 0x01 lesen; Antwort kommt als CMD 0x04).
+    // Endianness ist laut Doku unbestätigt – wird beim ersten echten Wert geprüft.
+    poll: {
+      intervalMs: 500,
+      reads: [
+        { name: 'speed',    target: 0x01, index: 0x26, len: 2 }, // 0,1 km/h -> /10
+        { name: 'battery',  target: 0x01, index: 0xB5, len: 2 }, // %
+        { name: 'odometer', target: 0x01, index: 0xB7, len: 4 }, // 0,001 km -> /1000
+      ],
+    },
+  },
 };
 
 /* ==========================================================================
- *  HILFSFUNKTION: Legacy-Ninebot-Paket bauen (nur für UNVERSCHLÜSSELTE Firmware)
- *  Aufbau laut Community-Dokumentation:
- *    5A A5 | len | src | dst | cmd | arg | payload… | checksum (2 Byte, little endian)
- *    len      = Anzahl Payload-Bytes
- *    checksum = (Summe aller Bytes von len bis Payload-Ende) XOR 0xFFFF
- *  Für den E2 Pro UNBESTÄTIGT. In der Browser-Konsole nutzbar:
- *    bytesToHex(buildNinebotFrame(0x3D, 0x20, 0x01, 0x22, [0x02]))
- *  (Die Zahlen im Beispiel sind beliebig, kein echter Befehl.)
+ *  NB-CRYPTO  –  reine JS-Krypto für Segway-Ninebot "Encryption2"
+ *  Quelle des Schemas: nootnooot.codeberg.page/segway-ninebot-ble
+ *  Enthält: AES-128 (ECB, nur Block-Encrypt), SHA-1, SHA-256,
+ *           Key-Ableitung, CTR-Keystream, CBC-MAC, Frame encode/decode.
+ *  Alles synchron, keine Abhängigkeiten.
  * ========================================================================== */
-function buildNinebotFrame(src, dst, cmd, arg, payload = []) {
-  const body = [payload.length, src, dst, cmd, arg, ...payload];
-  const sum = (body.reduce((a, b) => a + b, 0) ^ 0xffff) & 0xffff;
-  return new Uint8Array([0x5a, 0xa5, ...body, sum & 0xff, sum >> 8]);
+const NB = (() => {
+  'use strict';
+
+  /* ----------------------------- AES-128 ECB ----------------------------- */
+  // S-Box berechnet (multiplikatives Inverses in GF(2^8) via Log/Exp + affine Abb.)
+  const SBOX = (() => {
+    const xt = a => ((a << 1) ^ ((a & 0x80) ? 0x1b : 0)) & 0xff;
+    const LOG = new Uint8Array(256), EXP = new Uint8Array(256);
+    let x = 1;
+    for (let i = 0; i < 255; i++) { EXP[i] = x; LOG[x] = i; x ^= xt(x); }
+    EXP[255] = EXP[0];
+    const invert = a => (a === 0 ? 0 : EXP[(255 - LOG[a]) % 255]);
+    const sbox = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) {
+      let b = invert(i), s = b;
+      for (let k = 0; k < 4; k++) { s = ((s << 1) | (s >> 7)) & 0xff; b ^= s; }
+      sbox[i] = b ^ 0x63;
+    }
+    return sbox;
+  })();
+
+  const RCON = [0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36];
+  function xtime(a) { return ((a << 1) ^ ((a & 0x80) ? 0x1b : 0)) & 0xff; }
+  function mul(a, b) { let r = 0; for (let i = 0; i < 8; i++) { if (b & 1) r ^= a; const hi = a & 0x80; a = (a << 1) & 0xff; if (hi) a ^= 0x1b; b >>= 1; } return r & 0xff; }
+
+  function expandKey(key) {               // key: 16 Bytes → 176 Bytes (11 Rundenschlüssel)
+    const rk = new Uint8Array(176);
+    rk.set(key.subarray(0, 16));
+    let bytes = 16, rcon = 0;
+    const t = new Uint8Array(4);
+    while (bytes < 176) {
+      t.set(rk.subarray(bytes - 4, bytes));
+      if (bytes % 16 === 0) {
+        const tmp = t[0]; t[0] = SBOX[t[1]] ^ RCON[rcon++]; t[1] = SBOX[t[2]]; t[2] = SBOX[t[3]]; t[3] = SBOX[tmp];
+      }
+      for (let i = 0; i < 4; i++) { rk[bytes] = rk[bytes - 16] ^ t[i]; bytes++; }
+    }
+    return rk;
+  }
+
+  function encryptBlock(rk, inBlk) {      // inBlk: 16 Bytes → 16 Bytes
+    const s = new Uint8Array(inBlk.subarray(0, 16));
+    addRoundKey(s, rk, 0);
+    for (let round = 1; round < 10; round++) {
+      subBytes(s); shiftRows(s); mixColumns(s); addRoundKey(s, rk, round * 16);
+    }
+    subBytes(s); shiftRows(s); addRoundKey(s, rk, 160);
+    return s;
+  }
+  function addRoundKey(s, rk, off) { for (let i = 0; i < 16; i++) s[i] ^= rk[off + i]; }
+  function subBytes(s) { for (let i = 0; i < 16; i++) s[i] = SBOX[s[i]]; }
+  function shiftRows(s) {
+    const t = s.slice();
+    s[1]=t[5]; s[5]=t[9]; s[9]=t[13]; s[13]=t[1];
+    s[2]=t[10]; s[6]=t[14]; s[10]=t[2]; s[14]=t[6];
+    s[3]=t[15]; s[7]=t[3]; s[11]=t[7]; s[15]=t[11];
+  }
+  function mixColumns(s) {
+    for (let c = 0; c < 4; c++) {
+      const i = c * 4, a0 = s[i], a1 = s[i+1], a2 = s[i+2], a3 = s[i+3];
+      s[i]   = mul(a0,2) ^ mul(a1,3) ^ a2 ^ a3;
+      s[i+1] = a0 ^ mul(a1,2) ^ mul(a2,3) ^ a3;
+      s[i+2] = a0 ^ a1 ^ mul(a2,2) ^ mul(a3,3);
+      s[i+3] = mul(a0,3) ^ a1 ^ a2 ^ mul(a3,2);
+    }
+  }
+
+  function aesEcbEncrypt(key16, block16) { return encryptBlock(expandKey(key16), block16); }
+
+  /* ------------------------------- SHA-1 -------------------------------- */
+  function sha1(bytes) {
+    const ml = bytes.length * 8;
+    const withOne = bytes.length + 1;
+    const total = withOne + ((56 - withOne % 64 + 64) % 64) + 8;
+    const msg = new Uint8Array(total);
+    msg.set(bytes); msg[bytes.length] = 0x80;
+    const dv = new DataView(msg.buffer);
+    dv.setUint32(total - 4, ml >>> 0, false);
+    dv.setUint32(total - 8, Math.floor(ml / 0x100000000), false);
+    let h0=0x67452301,h1=0xEFCDAB89,h2=0x98BADCFE,h3=0x10325476,h4=0xC3D2E1F0;
+    const w = new Int32Array(80);
+    const rol = (n, s) => (n << s) | (n >>> (32 - s));
+    for (let off = 0; off < total; off += 64) {
+      for (let i = 0; i < 16; i++) w[i] = dv.getInt32(off + i * 4, false);
+      for (let i = 16; i < 80; i++) w[i] = rol(w[i-3]^w[i-8]^w[i-14]^w[i-16], 1);
+      let a=h0,b=h1,c=h2,d=h3,e=h4;
+      for (let i = 0; i < 80; i++) {
+        let f, k;
+        if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+        else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+        else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+        const tmp = (rol(a,5) + f + e + k + w[i]) | 0;
+        e = d; d = c; c = rol(b,30); b = a; a = tmp;
+      }
+      h0=(h0+a)|0; h1=(h1+b)|0; h2=(h2+c)|0; h3=(h3+d)|0; h4=(h4+e)|0;
+    }
+    const out = new Uint8Array(20), odv = new DataView(out.buffer);
+    [h0,h1,h2,h3,h4].forEach((h,i) => odv.setInt32(i*4, h, false));
+    return out;
+  }
+
+  /* ------------------------------ SHA-256 ------------------------------- */
+  const K256 = Uint32Array.from([
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+  function sha256(bytes) {
+    const ml = bytes.length * 8;
+    const withOne = bytes.length + 1;
+    const total = withOne + ((56 - withOne % 64 + 64) % 64) + 8;
+    const msg = new Uint8Array(total); msg.set(bytes); msg[bytes.length] = 0x80;
+    const dv = new DataView(msg.buffer);
+    dv.setUint32(total - 4, ml >>> 0, false);
+    dv.setUint32(total - 8, Math.floor(ml / 0x100000000), false);
+    let h = Uint32Array.from([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+    const w = new Uint32Array(64);
+    const rr = (n, s) => (n >>> s) | (n << (32 - s));
+    for (let off = 0; off < total; off += 64) {
+      for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4, false);
+      for (let i = 16; i < 64; i++) {
+        const s0 = rr(w[i-15],7) ^ rr(w[i-15],18) ^ (w[i-15] >>> 3);
+        const s1 = rr(w[i-2],17) ^ rr(w[i-2],19) ^ (w[i-2] >>> 10);
+        w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+      }
+      let [a,b,c,d,e,f,g,hh] = h;
+      for (let i = 0; i < 64; i++) {
+        const S1 = rr(e,6) ^ rr(e,11) ^ rr(e,25);
+        const ch = (e & f) ^ (~e & g);
+        const t1 = (hh + S1 + ch + K256[i] + w[i]) >>> 0;
+        const S0 = rr(a,2) ^ rr(a,13) ^ rr(a,22);
+        const maj = (a & b) ^ (a & c) ^ (b & c);
+        const t2 = (S0 + maj) >>> 0;
+        hh=g; g=f; f=e; e=(d+t1)>>>0; d=c; c=b; b=a; a=(t1+t2)>>>0;
+      }
+      h[0]=(h[0]+a)>>>0; h[1]=(h[1]+b)>>>0; h[2]=(h[2]+c)>>>0; h[3]=(h[3]+d)>>>0;
+      h[4]=(h[4]+e)>>>0; h[5]=(h[5]+f)>>>0; h[6]=(h[6]+g)>>>0; h[7]=(h[7]+hh)>>>0;
+    }
+    const out = new Uint8Array(32), odv = new DataView(out.buffer);
+    for (let i = 0; i < 8; i++) odv.setUint32(i*4, h[i], false);
+    return out;
+  }
+
+  /* ------------------------- Key-Ableitung ------------------------------ */
+  // k = SHA-1( pad16(key1) ‖ pad16(key2) )[0:16]
+  function pad16(b) { const o = new Uint8Array(16); o.set((b || new Uint8Array(0)).subarray(0, 16)); return o; }
+  function deriveKey(key1, key2) {
+    const inp = new Uint8Array(32); inp.set(pad16(key1), 0); inp.set(pad16(key2), 16);
+    return sha1(inp).subarray(0, 16);
+  }
+
+  const FW_DATA = Uint8Array.from([0x97,0xCF,0xB8,0x02,0x84,0x41,0x43,0xDE,0x56,0x00,0x2B,0x3B,0x34,0x78,0x0A,0x5D]);
+
+  /* ------------------- CTR-Keystream & CBC-MAC -------------------------- */
+  // nonce: 13 Byte = counter_BE32(4) ‖ auth[0:8] ‖ 0x00
+  function makeNonce(counter, auth) {
+    const n = new Uint8Array(13), dv = new DataView(n.buffer);
+    dv.setUint32(0, counter >>> 0, false);
+    n.set((auth || new Uint8Array(8)).subarray(0, 8), 4);
+    n[12] = 0x00;
+    return n;
+  }
+  // A_i = 0x01 ‖ nonce(13) ‖ 0x00 ‖ (i & 0xFF)
+  function ctrBlock(nonce, i) {
+    const a = new Uint8Array(16); a[0] = 0x01; a.set(nonce, 1); a[14] = 0x00; a[15] = i & 0xff; return a;
+  }
+  // B_0 = 0x59 ‖ nonce(13) ‖ 0x00 ‖ (payloadLen & 0xFF)
+  function macB0(nonce, payloadLen) {
+    const b = new Uint8Array(16); b[0] = 0x59; b.set(nonce, 1); b[14] = 0x00; b[15] = payloadLen & 0xff; return b;
+  }
+  function xorInto(dst, src, n) { for (let i = 0; i < n; i++) dst[i] ^= src[i]; }
+
+  // CBC-MAC über 3-Byte-Header (AAD) + payload → 4-Byte-Tag
+  function cbcMac(key16, nonce, header3, payload) {
+    const payloadLen = payload.length;
+    let X = aesEcbEncrypt(key16, macB0(nonce, payloadLen));
+    // Header-Block: 3 Byte Header, Rest 0
+    const hb = new Uint8Array(16); hb.set(header3.subarray(0, 3));
+    xorInto(X, hb, 16); X = aesEcbEncrypt(key16, X);
+    // Payload in 16er-Blöcken
+    for (let off = 0; off < payloadLen; off += 16) {
+      const blk = new Uint8Array(16);
+      blk.set(payload.subarray(off, Math.min(off + 16, payloadLen)));
+      xorInto(X, blk, 16); X = aesEcbEncrypt(key16, X);
+    }
+    return X.subarray(0, 4);
+  }
+
+  // CTR über payload (in-place neue Kopie), Blöcke beginnen bei i=1
+  function ctrCrypt(key16, nonce, payload) {
+    const out = new Uint8Array(payload.length);
+    for (let off = 0, i = 1; off < payload.length; off += 16, i++) {
+      const ks = aesEcbEncrypt(key16, ctrBlock(nonce, i));
+      const n = Math.min(16, payload.length - off);
+      for (let j = 0; j < n; j++) out[off + j] = payload[off + j] ^ ks[j];
+    }
+    return out;
+  }
+
+  /* --------------------------- Frame encode ----------------------------- */
+  // plain: komplettes Klartext-Frame beginnend mit [SYNC1, SYNC2, LEN, ...payload]
+  // return: [SYNC1,SYNC2,LEN, encPayload..., encTag(4), counter_BE16(2)]
+  function encrypt(key16, auth, counter, plain) {
+    const header3 = plain.subarray(0, 3);
+    const payload = plain.subarray(3);
+    const nonce = makeNonce(counter, auth);
+    const rawTag = cbcMac(key16, nonce, header3, payload);
+    const encPayload = ctrCrypt(key16, nonce, payload);
+    // Tag mit A_0-Keystream verschlüsseln
+    const ks0 = aesEcbEncrypt(key16, ctrBlock(nonce, 0));
+    const encTag = new Uint8Array(4);
+    for (let j = 0; j < 4; j++) encTag[j] = rawTag[j] ^ ks0[j];
+    const out = new Uint8Array(3 + encPayload.length + 4 + 2);
+    out.set(header3, 0); out.set(encPayload, 3); out.set(encTag, 3 + encPayload.length);
+    const dv = new DataView(out.buffer); dv.setUint16(out.length - 2, counter & 0xffff, false);
+    return out;
+  }
+
+  // frame: [SYNC1,SYNC2,LEN, encPayload..., encTag(4), counter_BE16(2)]
+  // return {ok, counter, plain} – plain = [SYNC1,SYNC2,LEN, payload...]
+  function decrypt(key16, auth, frame, lastCounter = -1) {
+    if (frame.length < 3 + 4 + 2) return { ok: false, reason: 'zu kurz' };
+    const header3 = frame.subarray(0, 3);
+    const dv = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+    const counter = dv.getUint16(frame.length - 2, false);
+    const encTag = frame.subarray(frame.length - 6, frame.length - 2);
+    const encPayload = frame.subarray(3, frame.length - 6);
+    if (counter <= lastCounter) return { ok: false, reason: 'replay', counter };
+    const nonce = makeNonce(counter, auth);
+    const payload = ctrCrypt(key16, nonce, encPayload); // CTR ist symmetrisch
+    const ks0 = aesEcbEncrypt(key16, ctrBlock(nonce, 0));
+    const rawTag = new Uint8Array(4);
+    for (let j = 0; j < 4; j++) rawTag[j] = encTag[j] ^ ks0[j];
+    const calc = cbcMac(key16, nonce, header3, payload);
+    for (let j = 0; j < 4; j++) if (calc[j] !== rawTag[j]) return { ok: false, reason: 'MAC', counter };
+    const plain = new Uint8Array(3 + payload.length);
+    plain.set(header3); plain.set(payload, 3);
+    return { ok: true, counter, plain };
+  }
+
+  /* --------------------------- Non-SN-Modus ----------------------------- */
+  // Nur für PRE_COMM (counter 0). Keystream = AES-ECB(key, 16×0), für jeden Block gleich.
+  // Wire: [SYNC1,SYNC2,LEN, encPayload..., 00 00 cksum_lo cksum_hi 00 00]
+  function encryptNonSN(key16, plain) {
+    const header3 = plain.subarray(0, 3);
+    const payload = plain.subarray(3);
+    const ks = aesEcbEncrypt(key16, new Uint8Array(16));
+    const enc = new Uint8Array(payload.length);
+    for (let i = 0; i < payload.length; i++) enc[i] = payload[i] ^ ks[i % 16];
+    let sum = 0; for (let i = 0; i < payload.length; i++) sum = (sum + payload[i]) & 0xffff;
+    const cks = (~sum) & 0xffff;
+    const out = new Uint8Array(3 + enc.length + 6);
+    out.set(header3, 0); out.set(enc, 3);
+    const tailOff = 3 + enc.length;
+    out[tailOff] = 0; out[tailOff+1] = 0; out[tailOff+2] = cks & 0xff; out[tailOff+3] = (cks >> 8) & 0xff; out[tailOff+4] = 0; out[tailOff+5] = 0;
+    return out;
+  }
+  function decryptNonSN(key16, frame) {
+    if (frame.length < 3 + 6) return { ok: false, reason: 'zu kurz' };
+    const header3 = frame.subarray(0, 3);
+    const enc = frame.subarray(3, frame.length - 6);
+    const ks = aesEcbEncrypt(key16, new Uint8Array(16));
+    const payload = new Uint8Array(enc.length);
+    for (let i = 0; i < enc.length; i++) payload[i] = enc[i] ^ ks[i % 16];
+    const plain = new Uint8Array(3 + payload.length);
+    plain.set(header3); plain.set(payload, 3);
+    return { ok: true, plain };
+  }
+
+  /* ---------------------------- Frame-Bauer ----------------------------- */
+  // Klartext-Frame: 5A A5 LEN | 3E TARGET CMD INDEX | DATA(LEN)
+  function buildPlain(sync2, targetId, cmd, index, data = new Uint8Array(0)) {
+    const d = data || new Uint8Array(0);
+    const out = new Uint8Array(7 + d.length);
+    out[0] = 0x5A; out[1] = sync2; out[2] = d.length & 0xff;
+    out[3] = 0x3E; out[4] = targetId & 0xff; out[5] = cmd & 0xff; out[6] = index & 0xff;
+    out.set(d, 7);
+    return out;
+  }
+  // Klartext-Frame zerlegen → { targetOrBoard, cmd, index, data }
+  function parsePlain(plain) {
+    if (plain.length < 7) return null;
+    return { b0: plain[3], target: plain[4], cmd: plain[5], index: plain[6], data: plain.subarray(7) };
+  }
+
+  return { aesEcbEncrypt, sha1, sha256, deriveKey, pad16, FW_DATA, makeNonce, cbcMac, ctrCrypt,
+           encrypt, decrypt, encryptNonSN, decryptNonSN, buildPlain, parsePlain };
+})();
+
+/* ==========================================================================
+ *  SEC  –  Handshake, Session & Telemetrie-Abfrage für den verschlüsselten E2 Pro
+ *  Phasen laut Doku: PRE_COMM (0x5B) -> SET_PWD (0x5C) -> AUTH (0x5D) -> COMM
+ *  Das Session-Passwort erzeugt die App selbst (echter Krypto-Zufall) und sendet
+ *  es beim ersten Pairing an den Scooter; er speichert es. Beim nächsten Mal wird
+ *  es aus dem Browser-Speicher wiederverwendet (stiller Reconnect).
+ *  NUR Auslesen & Komfort. Keine Tempo-/Firmware-Änderungen.
+ * ========================================================================== */
+const Sec = {
+  phase: 'idle',               // idle | pairing | comm | failed
+  auth: null, sn: null, password: null,
+  txCounter: 0, lastRx: -1,
+  commKey: null,
+  buf: new Uint8Array(0),
+  waiter: null,                // { resolve, timer }
+  pollTimer: null,
+  channelName: 'uart',         // 'uart' | 'alt'
+
+  nameBytes() { return new TextEncoder().encode(state.device?.name || ''); },
+  chan() { return Sec.channelName === 'alt' ? CONFIG.security.altChannel : CONFIG.security.channel; },
+
+  storeKey() { return 'e2.session.' + (state.device?.id || 'unknown'); },
+  loadStored() {
+    try { const j = JSON.parse(localStorage.getItem(Sec.storeKey()) || 'null'); return j ? { password: hexToBytes(j.password), sn: j.sn } : null; } catch { return null; }
+  },
+  saveStored() {
+    try { localStorage.setItem(Sec.storeKey(), JSON.stringify({ password: bytesToHex(Sec.password).replace(/ /g, ''), sn: Sec.sn, bt: state.device?.name, ts: Date.now() })); } catch {}
+  },
+  forgetStored() { try { localStorage.removeItem(Sec.storeKey()); } catch {} },
+
+  reset() {
+    Sec.phase = 'idle'; Sec.auth = null; Sec.password = null; Sec.commKey = null;
+    Sec.txCounter = 0; Sec.lastRx = -1; Sec.buf = new Uint8Array(0);
+    if (Sec.waiter) { clearTimeout(Sec.waiter.timer); Sec.waiter.reject(new Error('reset')); Sec.waiter = null; }
+    clearInterval(Sec.pollTimer); Sec.pollTimer = null;
+    setPairUI();
+  },
+
+  // Rohdaten aus onNotify. Nur den konfigurierten Notify-Kanal auswerten.
+  feed(char, bytes) {
+    if (canon(char.uuid) !== canon(Sec.chan().notify)) return;
+    const merged = new Uint8Array(Sec.buf.length + bytes.length);
+    merged.set(Sec.buf); merged.set(bytes, Sec.buf.length);
+    Sec.buf = merged;
+    // komplette Frames herausschneiden: beginnen mit 5A A5, Gesamtlänge = LEN + 13
+    for (;;) {
+      // Sync suchen
+      let i = 0;
+      while (i + 1 < Sec.buf.length && !(Sec.buf[i] === 0x5A && (Sec.buf[i+1] === 0xA5 || Sec.buf[i+1] === 0xB5))) i++;
+      if (i > 0) Sec.buf = Sec.buf.subarray(i);
+      if (Sec.buf.length < 3) return;
+      const total = Sec.buf[2] + 13;
+      if (Sec.buf.length < total) return;
+      const frame = Sec.buf.slice(0, total);
+      Sec.buf = Sec.buf.slice(total);
+      Sec.onFrame(frame);
+    }
+  },
+
+  onFrame(frame) {
+    if (Sec.waiter) {
+      const w = Sec.waiter; Sec.waiter = null; clearTimeout(w.timer); w.resolve(frame);
+    } else if (Sec.phase === 'comm') {
+      Sec.handleComm(frame);
+    }
+  },
+
+  async send(bytes) {
+    await writeToChar(await getChar(Sec.chan().service, Sec.chan().write), bytes, false);
+  },
+  waitFrame(ms) {
+    return new Promise((resolve, reject) => {
+      Sec.waiter = { resolve, reject, timer: setTimeout(() => { Sec.waiter = null; reject(new Error('Timeout')); }, ms) };
+    });
+  },
+  async sendAndWait(bytes, label, ms) {
+    await Sec.send(bytes);
+    const f = await Sec.waitFrame(ms);
+    Log.add('rx', `${label} ← ${bytesToHex(f)}`);
+    return f;
+  },
+
+  decSN(key, frame) {
+    const r = NB.decrypt(key, Sec.auth, frame, Sec.lastRx);
+    if (r.ok) Sec.lastRx = r.counter;
+    return r;
+  },
+
+  // ------------------------- Pairing-Ablauf -------------------------
+  async pair(serialOverride) {
+    if (state.conn !== 'connected') { toast('Erst verbinden', 'warn'); return; }
+    Sec.reset(); Sec.phase = 'pairing'; setPairUI();
+    const sync2 = CONFIG.security.sync2, target = CONFIG.security.targetId;
+    try {
+      // Notify-Kanal sicher abonnieren
+      const notifyChar = await getChar(Sec.chan().service, Sec.chan().notify);
+      hook(notifyChar);
+      try { await gatt(() => notifyChar.startNotifications()); } catch (e) { /* evtl. schon aktiv – ok */ }
+      Log.add('info', `Pairing über Kanal „${Sec.channelName}“ (${shortUuid(Sec.chan().notify)}) …`);
+
+      // Phase 1: PRE_COMM (non-SN)
+      let key = NB.deriveKey(Sec.nameBytes(), null);
+      const preReply = await Sec.sendAndWait(NB.encryptNonSN(key, NB.buildPlain(sync2, target, 0x5B, 0x00)), 'PRE_COMM', 3000);
+      const preDec = NB.decryptNonSN(key, preReply);
+      const pre = NB.parsePlain(preDec.plain);
+      if (!pre || pre.data.length < 16) throw new Error('PRE_COMM-Antwort unerwartet – evtl. falscher Kanal oder Gen (sync2).');
+      Sec.auth = pre.data.slice(0, 16);
+      const snDevice = new TextDecoder().decode(pre.data.slice(16, 30)).replace(/[^\x20-\x7e]/g, '').trim();
+      Sec.sn = (serialOverride || CONFIG.security.serialNumber || snDevice || '').trim();
+      Sec.txCounter = 1;
+      Log.add('ok', `PRE_COMM ok. SN: ${Sec.sn || '(leer)'} · auth erhalten · INDEX ${pre.index}`);
+
+      const stored = Sec.loadStored();
+      const hasPwd = pre.index !== 0;
+
+      if (hasPwd && stored) {
+        Sec.password = stored.password;
+        if (!Sec.sn) Sec.sn = stored.sn;
+        Log.add('info', 'Gespeichertes Passwort gefunden – überspringe SET_PWD.');
+      } else {
+        // Phase 2: SET_PWD (SN), ggf. mit Tastendruck-Bestätigung
+        key = NB.deriveKey(Sec.nameBytes(), Sec.auth);
+        Sec.password = (stored && stored.password) || NB.sha256(crypto.getRandomValues(new Uint8Array(16))).slice(0, 16);
+        let accepted = false;
+        setPairUI('Drücke jetzt kurz die Einschalttaste am Scooter, um das Pairing zu bestätigen.');
+        for (let attempt = 0; attempt < 30 && !accepted && Sec.phase === 'pairing'; attempt++) {
+          try {
+            const rep = await Sec.sendAndWait(NB.encrypt(key, Sec.auth, Sec.txCounter, NB.buildPlain(sync2, target, 0x5C, 0x00, Sec.password)), 'SET_PWD', 2500);
+            Sec.txCounter++;
+            const d = Sec.decSN(key, rep);
+            if (d.ok) {
+              const p = NB.parsePlain(d.plain);
+              if (p.index === 1) { accepted = true; break; }
+              Log.add('warn', 'SET_PWD: warte auf Tastendruck am Scooter …');
+            } else Log.add('warn', 'SET_PWD-Antwort nicht entschlüsselbar: ' + d.reason);
+          } catch (e) { Sec.txCounter++; Log.add('warn', 'SET_PWD Versuch: ' + e.message); }
+          await new Promise(r => setTimeout(r, 1500));
+        }
+        if (!accepted) throw new Error('SET_PWD nicht bestätigt (Tastendruck/Timeout).');
+        Log.add('ok', 'SET_PWD akzeptiert.');
+      }
+
+      // Phase 3: AUTH (SN)
+      key = NB.deriveKey(Sec.password, Sec.auth);
+      const snBytes = new TextEncoder().encode(Sec.sn);
+      const authRep = await Sec.sendAndWait(NB.encrypt(key, Sec.auth, Sec.txCounter, NB.buildPlain(sync2, target, 0x5D, 0x00, snBytes)), 'AUTH', 3000);
+      Sec.txCounter++;
+      const ad = Sec.decSN(key, authRep);
+      if (!ad.ok) throw new Error('AUTH-Antwort nicht entschlüsselbar: ' + ad.reason);
+      const ap = NB.parsePlain(ad.plain);
+      if (ap.index !== 1) throw new Error('AUTH abgelehnt (INDEX ' + ap.index + ').');
+
+      // COMM steht
+      Sec.commKey = key; Sec.phase = 'comm';
+      Sec.saveStored();
+      Log.add('ok', '✓ Authentifiziert – verschlüsselte Verbindung steht.');
+      toast('Pairing erfolgreich – lese jetzt Daten aus', 'ok');
+      FX.burstAt($('#connectBtn'), 90, [160, 188]);
+      setPairUI();
+      Sec.startPolling();
+    } catch (e) {
+      Sec.phase = 'failed';
+      Log.add('err', 'Pairing fehlgeschlagen: ' + e.message);
+      toast('Pairing fehlgeschlagen – Details im Log', 'err', 4500);
+      setPairUI();
+    }
+  },
+
+  // ------------------------- COMM: Telemetrie -------------------------
+  startPolling() {
+    clearInterval(Sec.pollTimer);
+    const reads = CONFIG.security.poll.reads;
+    let i = 0;
+    Sec.pollTimer = setInterval(async () => {
+      if (Sec.phase !== 'comm' || state.conn !== 'connected') return;
+      const r = reads[i % reads.length]; i++;
+      try {
+        const frame = NB.encrypt(Sec.commKey, Sec.auth, Sec.txCounter, NB.buildPlain(CONFIG.security.sync2, r.target, 0x01, r.index, Uint8Array.from([r.len])));
+        Sec.txCounter++;
+        await Sec.send(frame);
+      } catch (e) { Log.add('err', 'Abfrage ' + r.name + ': ' + e.message); }
+    }, Math.max(150, CONFIG.security.poll.intervalMs));
+    Log.add('info', 'Telemetrie-Abfrage läuft.');
+  },
+
+  handleComm(frame) {
+    const d = Sec.decSN(Sec.commKey, frame);
+    if (!d.ok) { Log.add('warn', 'COMM-Frame verworfen: ' + d.reason); return; }
+    const p = NB.parsePlain(d.plain);
+    if (!p) return;
+    Log.add('rx', `COMM entschlüsselt: tgt ${shortUuid(p.target).replace('0x','')} cmd ${p.cmd.toString(16)} idx 0x${p.index.toString(16)} = ${bytesToHex(p.data)}`);
+    // Antwort auf ein Register-Lesen (CMD 0x04) nach INDEX zuordnen
+    if (p.cmd === 0x04) {
+      const dv = new DataView(p.data.buffer, p.data.byteOffset, p.data.byteLength);
+      try {
+        if (p.index === 0x26 && p.data.length >= 2) updateTelemetry({ speed: dv.getUint16(0, true) / 10 });
+        else if (p.index === 0xB5 && p.data.length >= 1) updateTelemetry({ battery: p.data.length >= 2 ? dv.getUint16(0, true) : p.data[0] });
+        else if (p.index === 0xB7 && p.data.length >= 4) updateTelemetry({ odometer: dv.getUint32(0, true) / 1000 });
+      } catch (e) { Log.add('err', 'Telemetrie-Auswertung: ' + e.message); }
+    }
+  },
+
+  onDisconnected() { Sec.reset(); },
+};
+
+/* ---- Pairing-UI aktualisieren ---- */
+function setPairUI(hint) {
+  const badge = $('#pairState'), btn = $('#pairBtn'), hintEl = $('#pairHint');
+  if (!badge) return;
+  const map = {
+    idle:    { t: 'Nicht gekoppelt', c: '' },
+    pairing: { t: 'Pairing läuft …', c: 'warn' },
+    comm:    { t: '✓ Gekoppelt & liest', c: 'ok' },
+    failed:  { t: 'Fehlgeschlagen', c: 'err' },
+  };
+  const m = map[Sec.phase] || map.idle;
+  badge.textContent = m.t;
+  badge.className = 'pair-badge ' + m.c;
+  if (btn) btn.textContent = Sec.phase === 'comm' ? 'Neu koppeln' : (Sec.phase === 'pairing' ? 'Läuft …' : 'Pairing starten');
+  if (btn) btn.disabled = Sec.phase === 'pairing';
+  if (hintEl) hintEl.textContent = hint || '';
+}
+
+/* ---- Pairing-UI verdrahten ---- */
+function initSecurity() {
+  const sn = $('#snInput');
+  if (sn) {
+    sn.value = CONFIG.security.serialNumber || '';
+    sn.addEventListener('change', () => { CONFIG.security.serialNumber = sn.value.trim(); });
+  }
+  $('#pairBtn')?.addEventListener('click', () => {
+    if (state.conn !== 'connected') { toast('Erst oben verbinden', 'warn'); return; }
+    Sec.pair(sn ? sn.value.trim() : '');
+  });
+  $('#pairChannelBtn')?.addEventListener('click', e => {
+    Sec.channelName = Sec.channelName === 'uart' ? 'alt' : 'uart';
+    e.currentTarget.textContent = 'Kanal: ' + (Sec.channelName === 'uart' ? 'UART' : 'Segway');
+    Log.add('info', `Pairing-Kanal: ${Sec.channelName}`);
+  });
+  $('#pairForgetBtn')?.addEventListener('click', () => {
+    Sec.forgetStored(); Sec.reset();
+    toast('Gespeicherte Kopplung gelöscht', 'ok');
+  });
+  setPairUI();
 }
 
 /* ==========================================================================
@@ -1074,6 +1668,11 @@ async function connect(forcePicker = false) {
     toast(`Verbunden mit ${state.device.name || 'Gerät'}`, 'ok');
     requestWakeLock();
     await startTelemetry();
+    // Verschlüsselter E2 Pro: bei vorhandenem gespeicherten Passwort still neu koppeln
+    if (CONFIG.security.enabled && Sec.loadStored()) {
+      Log.add('info', 'Gespeicherte Kopplung gefunden – verbinde verschlüsselt neu …');
+      Sec.pair().catch(() => {});
+    }
   } catch (e) {
     if (e.name === 'NotFoundError') Log.add('warn', 'Auswahl abgebrochen oder kein Gerät gefunden.');
     else { Log.add('err', `Verbindung fehlgeschlagen: ${e.name}: ${e.message}`); toast('Verbindung fehlgeschlagen – Details im Entdecker-Log.', 'err'); }
@@ -1089,6 +1688,7 @@ function disconnect() {
 function onDisconnected() {
   const was = state.conn === 'connected';
   clearInterval(state.pollTimer); state.pollTimer = null;
+  if (CONFIG.security.enabled) Sec.onDisconnected();
   state.server = null; state.charCache.clear(); state.explorerChars.clear();
   if (!state.demo) { state.telemetry = { speed: null, battery: null, odometer: null, temperature: null }; state.source = 'none'; }
   setConn('disconnected');
@@ -1130,6 +1730,7 @@ function onNotify(e) {
   const c = e.target, bytes = dvToBytes(c.value);
   Log.add('rx', `${nameOf(c.uuid)} ${shortUuid(c.uuid)} ← ${bytesToHex(bytes)}`, bytesToAscii(bytes));
   showCharValue(c, bytes);
+  if (CONFIG.security.enabled) { try { Sec.feed(c, bytes); } catch (err) { Log.add('err', 'Sec.feed: ' + err.message); } }
   if (canon(c.uuid) === canon(0x2a19) && bytes.length) updateTelemetry({ battery: bytes[0] }); // offizieller Battery-Level
   try { updateTelemetry(CONFIG.telemetry.parse(bytes, c.uuid)); }
   catch (err) { Log.add('err', 'Fehler in CONFIG.telemetry.parse(): ' + err.message); }
@@ -1524,6 +2125,7 @@ async function init() {
   FX.init();
   initControls();
   initExplorer();
+  initSecurity();
   setConn('disconnected');
 
   $('#connectBtn').addEventListener('pointerdown', ev => addRipple($('#connectBtn'), ev));
