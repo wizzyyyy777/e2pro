@@ -520,7 +520,7 @@ textarea.field:focus,input.field:focus{border-color:var(--cyan);box-shadow:0 0 0
         <input class="field" id="snInput" placeholder="z. B. N4GZ..." autocomplete="off" autocapitalize="characters" spellcheck="false" style="margin-bottom:10px">
         <div class="btns">
           <button class="btn primary" id="pairBtn">Pairing starten</button>
-          <button class="btn" id="pairChannelBtn">Kanal: UART</button>
+          <button class="btn" id="pairChannelBtn">Kanal: Segway</button>
           <button class="btn" id="pairForgetBtn">Kopplung löschen</button>
         </div>
         <p class="batt-meta" id="pairHint" style="margin:10px 0 0;line-height:1.5;color:var(--amber)"></p>
@@ -626,7 +626,7 @@ const CONFIG = {
   // Weitere UUIDs kannst du auch direkt im Entdecker-Tab ergänzen.
   optionalServices: [
     '6e400001-b5a3-f393-e0a9-e50e24dcca9e', // Nordic UART Service (beim E2 Pro vorhanden)
-    'a6ed0800-d344-460a-8075-b9e8ec90d71b', // Segway-Service deines E2 Pro (Chars A6ED0801/0802/0803)
+    'a6ed0801-d344-460a-8075-b9e8ec90d71b', // Segway-Service deines E2 Pro (Chars A6ED0802 Notify / A6ED0803 Write+Indicate)
     0x180f,                                 // Battery Service (offizieller BLE-Standard, falls vorhanden)
     0x180a,                                 // Device Information (offizieller BLE-Standard, falls vorhanden)
     0xfe95,                                 // Xiaomi-Service (bei manchen Xiaomi/Ninebot-Geräten)
@@ -690,18 +690,20 @@ const CONFIG = {
     targetId: 0x04,    // BLE-Board (Ziel im Handshake)
 
     // Kanal für die verschlüsselte Kommunikation.
-    // Standard: Nordic UART (beim E2 Pro vorhanden). Antwortet nichts, probiere den
-    // Segway-Kanal darunter (im Pairing-Tab umschaltbar).
+    // Standard: Segway-Service deines E2 Pro (per Scan bestätigt):
+    //   Service A6ED0801, Notify A6ED0802, Write+Indicate A6ED0803.
+    // Antwort-Kanäle (Notify 0802 UND Indicate 0803) werden beide abonniert.
     channel: {
+      service: 'a6ed0801-d344-460a-8075-b9e8ec90d71b',
+      write:   'a6ed0803-d344-460a-8075-b9e8ec90d71b', // WRITE + INDICATE
+      notify:  'a6ed0802-d344-460a-8075-b9e8ec90d71b', // NOTIFY
+      indicate: 'a6ed0803-d344-460a-8075-b9e8ec90d71b', // zusätzlich abonnieren (Antworten)
+    },
+    // Alternativer Kanal (Nordic UART) – per Button im Pairing-Tab wählbar.
+    altChannel: {
       service: '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
       write:   '6e400002-b5a3-f393-e0a9-e50e24dcca9e',
       notify:  '6e400003-b5a3-f393-e0a9-e50e24dcca9e',
-    },
-    // Alternativer Kanal (Segway-Service deines Scooters) – per Button im Pairing-Tab wählbar.
-    altChannel: {
-      service: 'a6ed0800-d344-460a-8075-b9e8ec90d71b',
-      write:   'a6ed0801-d344-460a-8075-b9e8ec90d71b',
-      notify:  'a6ed0802-d344-460a-8075-b9e8ec90d71b',
     },
 
     // DIS-Board-Register zum Auslesen (CMD 0x01 lesen; Antwort kommt als CMD 0x04).
@@ -1034,7 +1036,7 @@ const Sec = {
   buf: new Uint8Array(0),
   waiter: null,                // { resolve, timer }
   pollTimer: null,
-  channelName: 'uart',         // 'uart' | 'alt'
+  channelName: 'seg',          // 'seg' (Segway, Standard) | 'alt' (Nordic UART)
 
   nameBytes() { return new TextEncoder().encode(state.device?.name || ''); },
   chan() { return Sec.channelName === 'alt' ? CONFIG.security.altChannel : CONFIG.security.channel; },
@@ -1056,9 +1058,11 @@ const Sec = {
     setPairUI();
   },
 
-  // Rohdaten aus onNotify. Nur den konfigurierten Notify-Kanal auswerten.
+  // Rohdaten aus onNotify. Auf dem Notify- UND dem Indicate-Kanal lauschen.
   feed(char, bytes) {
-    if (canon(char.uuid) !== canon(Sec.chan().notify)) return;
+    const ch = Sec.chan();
+    const u = canon(char.uuid);
+    if (u !== canon(ch.notify) && !(ch.indicate && u === canon(ch.indicate))) return;
     const merged = new Uint8Array(Sec.buf.length + bytes.length);
     merged.set(Sec.buf); merged.set(bytes, Sec.buf.length);
     Sec.buf = merged;
@@ -1112,11 +1116,17 @@ const Sec = {
     Sec.reset(); Sec.phase = 'pairing'; setPairUI();
     const sync2 = CONFIG.security.sync2, target = CONFIG.security.targetId;
     try {
-      // Notify-Kanal sicher abonnieren
-      const notifyChar = await getChar(Sec.chan().service, Sec.chan().notify);
-      hook(notifyChar);
-      try { await gatt(() => notifyChar.startNotifications()); } catch (e) { /* evtl. schon aktiv – ok */ }
-      Log.add('info', `Pairing über Kanal „${Sec.channelName}“ (${shortUuid(Sec.chan().notify)}) …`);
+      // Antwort-Kanäle abonnieren: Notify und (falls vorhanden) Indicate
+      const ch = Sec.chan();
+      for (const uuid of [ch.notify, ch.indicate].filter(Boolean)) {
+        try {
+          const c = await getChar(ch.service, uuid);
+          hook(c);
+          await gatt(() => c.startNotifications());
+          Log.add('ok', `Lausche auf ${shortUuid(uuid)}`);
+        } catch (e) { Log.add('warn', `Konnte ${shortUuid(uuid)} nicht abonnieren: ${e.message || e.name || e}`); }
+      }
+      Log.add('info', `Pairing über Kanal „${Sec.channelName === 'alt' ? 'UART' : 'Segway'}“ · schreibe an ${shortUuid(ch.write)} …`);
 
       // Phase 1: PRE_COMM (non-SN)
       let key = NB.deriveKey(Sec.nameBytes(), null);
@@ -1180,7 +1190,7 @@ const Sec = {
       Sec.startPolling();
     } catch (e) {
       Sec.phase = 'failed';
-      Log.add('err', 'Pairing fehlgeschlagen: ' + e.message);
+      Log.add('err', 'Pairing fehlgeschlagen: ' + (e && (e.message || e.name) || e || 'unbekannt'));
       toast('Pairing fehlgeschlagen – Details im Log', 'err', 4500);
       setPairUI();
     }
@@ -1253,9 +1263,9 @@ function initSecurity() {
     Sec.pair(sn ? sn.value.trim() : '');
   });
   $('#pairChannelBtn')?.addEventListener('click', e => {
-    Sec.channelName = Sec.channelName === 'uart' ? 'alt' : 'uart';
-    e.currentTarget.textContent = 'Kanal: ' + (Sec.channelName === 'uart' ? 'UART' : 'Segway');
-    Log.add('info', `Pairing-Kanal: ${Sec.channelName}`);
+    Sec.channelName = Sec.channelName === 'alt' ? 'seg' : 'alt';
+    e.currentTarget.textContent = 'Kanal: ' + (Sec.channelName === 'alt' ? 'UART' : 'Segway');
+    Log.add('info', `Pairing-Kanal: ${Sec.channelName === 'alt' ? 'UART' : 'Segway'}`);
   });
   $('#pairForgetBtn')?.addEventListener('click', () => {
     Sec.forgetStored(); Sec.reset();
